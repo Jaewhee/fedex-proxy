@@ -53,6 +53,8 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     const order = gqlJson?.data?.order;
     const fulfillments = order?.fulfillments ?? [];
 
+    console.log('Fulfillments:', fulfillments);
+
     // Edge case: no fulfillments or no tracking numbers yet
     const allTracks = [];
     fulfillments.forEach(f => {
@@ -64,6 +66,8 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
       return res.json({ ok: true, message: 'No tracking numbers yet.', orderId, fulfillments, results: [] });
     }
 
+    console.log('allTracks:', allTracks);
+
     // 2) FedEx OAuth
     const token = await getFedExToken();
 
@@ -71,16 +75,22 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     //    (Deduplicate tracking numbers to avoid double calls)
     const dedup = [...new Set(allTracks.map(t => t.number))];
 
+    console.log('dedup:', dedup);
+    console.log('shipDateBegin:', shipDateBegin);
+
     const fedexByNumber = Object.create(null);
     await Promise.all(
       dedup.map(async (trackingNumber) => {
         const payload = {
-          includeDetailedScans: false,
+          includeDetailedScans: true,
           trackingInfo: [{
             ...(shipDateBegin ? { shipDateBegin } : {}),
             trackingNumberInfo: { trackingNumber } // omit carrierCode to let FedEx infer
           }]
         };
+
+        console.log('payload:', JSON.stringify(payload, null, 2));
+
         const fx = await fetch('https://apis-sandbox.fedex.com/track/v1/trackingnumbers', {
           method: 'POST',
           headers: {
@@ -100,7 +110,9 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     for (const number of Object.keys(fedexByNumber)) {
       const fx = fedexByNumber[number];
       const result = fx?.output?.completeTrackResults?.[0]?.trackResults?.[0];
+      console.log('result: ', result);
       const latest = result?.latestStatusDetail;
+      console.log('latest', latest);
       trackSummaries[number] = {
         delivered: isFedExDelivered(result),
         statusCode: latest?.code || latest?.statusCode || null,
@@ -108,13 +120,16 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
         estimatedDelivery: result?.estimatedDeliveryTimestamp || null,
         raw: fx, // keep raw for debugging; remove later if too large
       };
+      console.log('trackSummaries[number]: ', trackSummaries[number]);
     }
 
     // 5) Decide delivered per fulfillment (ALL tracking numbers must be delivered)
     const fulfillmentUpdates = [];
     const fulfillmentSummaries = fulfillments.map(f => {
       const numbers = (f.trackingInfo || []).map(ti => ti.number).filter(Boolean);
+      console.log('numbers: ', numbers);
       const perTrack = numbers.map(n => ({ number: n, ...trackSummaries[n] }));
+      console.log('perTrack: ', perTrack);
       const allDelivered = numbers.length > 0 && perTrack.every(pt => pt.delivered === true);
 
       // Queue Shopify update if all delivered and not already delivered
@@ -132,6 +147,8 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
 
     // 6) Perform Shopify updates in parallel (best-effort)
     const updateResults = await Promise.allSettled(fulfillmentUpdates);
+
+    console.log('fulfillmentSummaries: ', JSON.stringify(fulfillmentSummaries, null, 2));
 
     // 7) Response payload
     return res.json({
