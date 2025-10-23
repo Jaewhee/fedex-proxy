@@ -1,6 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import { getFedExToken } from './util.js';
+import { getFedExToken, isFedExDelivered, markFulfillmentDelivered } from './util.js';
 
 dotenv.config();
 
@@ -23,7 +23,7 @@ app.get('/proxy/fedex-status', (req, res) => {
 });
 
 app.post('/proxy/fedex-status/tracking', async (req, res) => {
-  const { orderId, shipDateBegin } = req.body || {};
+  const { orderId } = req.body || {};
   if (!orderId) return res.status(400).json({ ok: false, message: 'Missing orderId' });
 
   try {
@@ -33,10 +33,16 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
         order(id: $id) {
           id
           name
+          displayFulfillmentStatus
           fulfillments {
             id
             status
-            trackingInfo { number company url }
+            displayStatus
+            trackingInfo {
+              number
+              company
+              url
+            }
           }
         }
       }
@@ -52,8 +58,7 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     const gqlJson = await gqlRes.json();
     const order = gqlJson?.data?.order;
     const fulfillments = order?.fulfillments ?? [];
-
-    console.log('Fulfillments:', fulfillments);
+    const fulfillmentStatus = order?.displayFulfillmentStatus;
 
     // Edge case: no fulfillments or no tracking numbers yet
     const allTracks = [];
@@ -75,21 +80,15 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     //    (Deduplicate tracking numbers to avoid double calls)
     const dedup = [...new Set(allTracks.map(t => t.number))];
 
-    console.log('dedup:', dedup);
-    console.log('shipDateBegin:', shipDateBegin);
-
     const fedexByNumber = Object.create(null);
     await Promise.all(
       dedup.map(async (trackingNumber) => {
         const payload = {
-          includeDetailedScans: true,
+          includeDetailedScans: false,
           trackingInfo: [{
-            ...(shipDateBegin ? { shipDateBegin } : {}),
             trackingNumberInfo: { trackingNumber } // omit carrierCode to let FedEx infer
           }]
         };
-
-        console.log('payload:', JSON.stringify(payload, null, 2));
 
         const fx = await fetch('https://apis-sandbox.fedex.com/track/v1/trackingnumbers', {
           method: 'POST',
@@ -110,7 +109,6 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     for (const number of Object.keys(fedexByNumber)) {
       const fx = fedexByNumber[number];
       const result = fx?.output?.completeTrackResults?.[0]?.trackResults?.[0];
-      console.log('result: ', result);
       const latest = result?.latestStatusDetail;
       console.log('latest', latest);
       trackSummaries[number] = {
@@ -118,7 +116,7 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
         statusCode: latest?.code || latest?.statusCode || null,
         statusDesc: latest?.description || null,
         estimatedDelivery: result?.estimatedDeliveryTimestamp || null,
-        raw: fx, // keep raw for debugging; remove later if too large
+        raw: fx,
       };
       console.log('trackSummaries[number]: ', trackSummaries[number]);
     }
@@ -127,34 +125,46 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     const fulfillmentUpdates = [];
     const fulfillmentSummaries = fulfillments.map(f => {
       const numbers = (f.trackingInfo || []).map(ti => ti.number).filter(Boolean);
-      console.log('numbers: ', numbers);
       const perTrack = numbers.map(n => ({ number: n, ...trackSummaries[n] }));
-      console.log('perTrack: ', perTrack);
-      const allDelivered = numbers.length > 0 && perTrack.every(pt => pt.delivered === true);
-
-      // Queue Shopify update if all delivered and not already delivered
-      if (allDelivered && f.status !== 'DELIVERED') {
-        fulfillmentUpdates.push(markFulfillmentDelivered(f.id));
-      }
 
       return {
         fulfillmentId: f.id,
-        status: f.status,
-        allDelivered,
+        status: f.displayStatus,
         tracks: perTrack,
       };
     });
 
+    const allDelivered =
+      fulfillmentSummaries.length > 0 &&
+      fulfillmentSummaries.every(f =>
+        Array.isArray(f.tracks) &&
+        f.tracks.length > 0 &&
+        f.tracks.every(t => t.delivered === true || t.statusCode === 'DL')
+      );
+    console.log('allDelivered:', allDelivered);
+
+    if (allDelivered) {
+      // Queue fulfillmentMarkAsDelivered calls
+      fulfillmentSummaries.forEach(f => {
+        if (f.status !== 'DELIVERED') {
+          console.log(`Queuing fulfillmentMarkAsDelivered for fulfillment ${f.fulfillmentId}`);
+          const actualDeliveryDate = f.tracks[0].raw.output.completeTrackResults[0].trackResults[0].dateAndTimes.find(dt => dt.type === 'ACTUAL_DELIVERY')?.dateTime;
+          console.log(`Actual delivery date for fulfillment ${f.fulfillmentId}: ${actualDeliveryDate}`);
+          fulfillmentUpdates.push(markFulfillmentDelivered(f.fulfillmentId, actualDeliveryDate));
+        }
+      });
+    }
+
     // 6) Perform Shopify updates in parallel (best-effort)
     const updateResults = await Promise.allSettled(fulfillmentUpdates);
-
-    console.log('fulfillmentSummaries: ', JSON.stringify(fulfillmentSummaries, null, 2));
 
     // 7) Response payload
     return res.json({
       ok: true,
       message: 'Tracking checked.',
       order: { id: order.id, name: order.name },
+      allDelivered,
+      fulfillmentStatus,
       fulfillmentSummaries,
       updateResults, // statuses from fulfillmentMarkAsDelivered (settled)
     });
@@ -162,38 +172,6 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
   } catch (err) {
     console.error('tracking proxy error', err);
     return res.status(500).json({ ok: false, message: 'Server error', error: String(err) });
-  }
-
-  // --- helpers ---
-
-  function isFedExDelivered(trackResult) {
-    // trackResult is `completeTrackResults[0].trackResults[0]`
-    if (!trackResult) return false;
-    const latest = trackResult.latestStatusDetail || {};
-    const code = latest.code || latest.statusCode || '';
-    const desc = (latest.description || '').toLowerCase();
-    // FedEx often uses 'DL' for delivered; fallback to description text
-    return code === 'DL' || desc.includes('delivered');
-  }
-
-  async function markFulfillmentDelivered(fulfillmentId) {
-    const m = `
-      mutation MarkDelivered($id: ID!) {
-        fulfillmentMarkAsDelivered(id: $id) {
-          fulfillment { id status }
-          userErrors { field message }
-        }
-      }
-    `;
-    const r = await fetch(`https://${process.env.SHOP_DOMAIN}/admin/api/2025-10/graphql.json`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
-      },
-      body: JSON.stringify({ query: m, variables: { id: fulfillmentId } }),
-    });
-    return r.json();
   }
 });
 
