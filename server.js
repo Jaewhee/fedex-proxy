@@ -135,6 +135,7 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
     });
 
     const allDelivered =
+      fulfillmentStatus === 'FULFILLED' &&
       fulfillmentSummaries.length > 0 &&
       fulfillmentSummaries.every(f =>
         Array.isArray(f.tracks) &&
