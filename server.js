@@ -38,6 +38,19 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
             id
             status
             displayStatus
+            fulfillmentLineItems(first: 10) {
+              edges {
+                node {
+                  id
+                  quantity
+                  lineItem {
+                    id
+                    name
+                    sku
+                  }
+                }
+              }
+            }
             trackingInfo {
               number
               company
@@ -131,6 +144,7 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
         fulfillmentId: f.id,
         status: f.displayStatus,
         tracks: perTrack,
+        fulfillmentLineItems: f.fulfillmentLineItems,
       };
     });
 
@@ -143,6 +157,7 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
         f.tracks.every(t => t.delivered === true || t.statusCode === 'DL')
       );
     console.log('allDelivered:', allDelivered);
+    console.log('fulfillmentSummaries:', fulfillmentSummaries);
 
     if (allDelivered) {
       // Queue fulfillmentMarkAsDelivered calls
