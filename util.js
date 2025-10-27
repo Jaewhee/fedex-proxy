@@ -5,7 +5,7 @@ export async function getFedExToken() {
     client_secret: process.env.FEDEX_SECRET_KEY,
   });
 
-  const res = await fetch('https://apis-sandbox.fedex.com/oauth/token', {
+  const res = await fetch('https://apis.fedex.com/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
