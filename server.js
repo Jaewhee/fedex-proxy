@@ -103,7 +103,7 @@ app.post('/proxy/fedex-status/tracking', async (req, res) => {
           }]
         };
 
-        const fx = await fetch('https://apis-sandbox.fedex.com/track/v1/trackingnumbers', {
+        const fx = await fetch('https://apis.fedex.com/track/v1/trackingnumbers', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
